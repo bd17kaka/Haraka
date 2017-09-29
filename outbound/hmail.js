@@ -26,6 +26,29 @@ const obtls       = require('./tls');
 
 const FsyncWriteStream = require('./fsync_writestream');
 
+var redis   = require("redis");
+var options = {
+	host : "120.24.160.140",
+	port : 6379,
+	password : "hell0%a"
+};
+
+var client  = redis.createClient(options);
+client.on("error", function (err) {
+	client = redis.createClient(options);
+});
+
+const REDISKEY_USERNOTFOUND = 'USER_NOT_FOUND';
+const REDISKEY_USERFOUND = 'USER_FOUND';
+const REDISKEY_MXNOTFOUND = 'MX_NOT_FOUND';
+const REDISKEY_DOMAINNOTFOUND = 'DOMAIN_NOT_FOUND';
+const REDISKEY_CONNECTTIMEOUT = 'CONNECT_TIMEOUT';
+
+function updateDate(key, email) {
+	email = email.toString().replace('<', '').replace('>', '').replace('"', '');
+	client.sadd(key, email);
+}
+
 let queue_dir;
 let temp_fail_queue;
 let delivery_queue;
@@ -235,12 +258,15 @@ HMailItem.prototype.found_mx = function (err, mxs) {
             this.todo.rcpt_to.forEach(function (rcpt) {
                 hmail.extend_rcpt_with_dsn(rcpt, DSN.addr_bad_dest_system("No Such Domain: " + hmail.todo.domain));
             });
+
+			updateDate(REDISKEY_MXNOTFOUND, this.todo.domain);
             this.bounce("No Such Domain: " + this.todo.domain);
         }
         else if (err.code === 'NOMX') {
             this.todo.rcpt_to.forEach(function (rcpt) {
                 hmail.extend_rcpt_with_dsn(rcpt, DSN.addr_bad_dest_system("Nowhere to deliver mail to for domain: " + hmail.todo.domain));
             });
+			updateDate(REDISKEY_DOMAINNOTFOUND, hmail.todo.domain);
             this.bounce("Nowhere to deliver mail to for domain: " + hmail.todo.domain);
         }
         else {
@@ -589,33 +615,57 @@ HMailItem.prototype.try_deliver_host_on_socket = function (mx, host, port, socke
 
     let fp_called = false;
     const finish_processing_mail = function (success) {
-        if (fp_called) {
-            return self.logerror("finish_processing_mail called multiple times! Stack: " + (new Error()).stack);
-        }
-        fp_called = true;
-        if (fail_recips.length) {
-            self.refcount++;
-            split_to_new_recipients(self, fail_recips, "Some recipients temporarily failed", function (hmail) {
-                self.discard();
-                hmail.temp_fail("Some recipients temp failed: " + fail_recips.join(', '), { rcpt: fail_recips, mx: mx });
-            });
-        }
-        if (bounce_recips.length) {
-            self.refcount++;
-            split_to_new_recipients(self, bounce_recips, "Some recipients rejected", function (hmail) {
-                self.discard();
-                hmail.bounce("Some recipients failed: " + bounce_recips.join(', '), { rcpt: bounce_recips, mx: mx });
-            });
-        }
+        // if (fp_called) {
+        //     return self.logerror("finish_processing_mail called multiple times! Stack: " + (new Error()).stack);
+        // }
+        // fp_called = true;
+        // if (fail_recips.length) {
+        //     self.refcount++;
+        //     split_to_new_recipients(self, fail_recips, "Some recipients temporarily failed", function (hmail) {
+        //         self.discard();
+        //         hmail.temp_fail("Some recipients temp failed: " + fail_recips.join(', '), { rcpt: fail_recips, mx: mx });
+        //     });
+        // }
+        // if (bounce_recips.length) {
+        //     self.refcount++;
+        //     split_to_new_recipients(self, bounce_recips, "Some recipients rejected", function (hmail) {
+        //         self.discard();
+        //         hmail.bounce("Some recipients failed: " + bounce_recips.join(', '), { rcpt: bounce_recips, mx: mx });
+        //     });
+        // }
+		
+		// 
+
+		if (ok_recips.length) {
+			for (var i in ok_recips) {
+				self.loginfo('TKP: ' + ok_recips[i] + ' is 200');
+				updateDate(REDISKEY_USERFOUND, ok_recips[i]);
+			}
+		}
+		if (fail_recips.length) {
+			for (var i in fail_recips) {
+				self.loginfo('TKP: ' + fail_recips[i] + ' is 400');
+				// updateDate(REDISKEY_USERNOTFOUND, fail_recips[i]);
+			}
+		}
+		if (bounce_recips.length) {
+			for (var i in bounce_recips) {
+				self.loginfo('TKP:' + bounce_recips[i] + ' is 500');
+				updateDate(REDISKEY_USERNOTFOUND, bounce_recips[i]);
+			}
+		}
+
         processing_mail = false;
-        if (success) {
-            const reason = response.join(' ');
-            self.delivered(host, port, (mx.using_lmtp ? 'LMTP' : 'SMTP'), mx.exchange,
-                reason, ok_recips, fail_recips, bounce_recips, secured, authenticated);
-        }
-        else {
-            self.discard();
-        }
+        // if (success) {
+        //     const reason = response.join(' ');
+        //     self.delivered(host, port, (mx.using_lmtp ? 'LMTP' : 'SMTP'), mx.exchange,
+        //         reason, ok_recips, fail_recips, bounce_recips, secured, authenticated);
+        // }
+        // else {
+        //     self.discard();
+        // }
+
+		self.discard();
         if (cfg.pool_concurrency_max) {
             send_command('RSET');
         }
@@ -822,19 +872,20 @@ HMailItem.prototype.try_deliver_host_on_socket = function (mx, host, port, socke
                         if (last_recip && code.match(/^250/)) {
                             ok_recips.push(last_recip);
                         }
-                        if (recip_index === recipients.length) { // End of RCPT TOs
-                            if (ok_recips.length > 0) {
-                                send_command('DATA');
-                            }
-                            else {
-                                finish_processing_mail(false);
-                            }
-                        }
-                        else {
-                            last_recip = recipients[recip_index];
-                            recip_index++;
-                            send_command('RCPT', 'TO:' + last_recip.format(!smtp_properties.smtp_utf8));
-                        }
+                        // if (recip_index === recipients.length) { // End of RCPT TOs
+                        //      if (ok_recips.length > 0) {
+                        //          send_command('DATA');
+                        //      }
+                        //      else {
+                        //          finish_processing_mail(false);
+                        //     }
+                        // }
+                        // else {
+                        //     last_recip = recipients[recip_index];
+                        //     recip_index++;
+                        //     send_command('RCPT', 'TO:' + last_recip.format(!smtp_properties.smtp_utf8));
+                        // }
+						finish_processing_mail(false);
                         break;
                     case 'data': {
                         const data_stream = self.data_stream();
@@ -1133,14 +1184,15 @@ HMailItem.prototype.populate_bounce_message_with_headers = function (from, to, r
 }
 
 HMailItem.prototype.bounce = function (err, opts) {
-    this.loginfo("bouncing mail: " + err);
-    if (!this.todo) {
-        // haven't finished reading the todo, delay here...
-        const self = this;
-        self.once('ready', function () { self._bounce(err, opts); });
-        return;
-    }
-    this._bounce(err, opts);
+    this.loginfo("HACK -- bouncing mail: " + err);
+	this.discard();
+    // if (!this.todo) {
+    //     // haven't finished reading the todo, delay here...
+    //     const self = this;
+    //     self.once('ready', function () { self._bounce(err, opts); });
+    //     return;
+    // }
+    // this._bounce(err, opts);
 };
 
 HMailItem.prototype._bounce = function (err, opts) {
@@ -1233,25 +1285,26 @@ HMailItem.prototype.convert_temp_failed_to_bounce = function (err, extra) {
 }
 
 HMailItem.prototype.temp_fail = function (err, extra) {
-    logger.logdebug("Temp fail for: " + err);
-    this.num_failures++;
+    logger.logdebug("HACK -- Temp fail for: " + err);
+	this.discard();
+    // this.num_failures++;
 
-    // Test for max failures which is configurable.
-    if (this.num_failures >= (cfg.maxTempFailures)) {
-        return this.convert_temp_failed_to_bounce("Too many failures (" + err + ")", extra);
-    }
+    // // Test for max failures which is configurable.
+    // if (this.num_failures >= (cfg.maxTempFailures)) {
+    //     return this.convert_temp_failed_to_bounce("Too many failures (" + err + ")", extra);
+    // }
 
-    // basic strategy is we exponentially grow the delay to the power
-    // two each time, starting at 2 ** 6 seconds
+    // // basic strategy is we exponentially grow the delay to the power
+    // // two each time, starting at 2 ** 6 seconds
 
-    // Note: More advanced options should be explored in the future as the
-    // last delay is 2**17 secs (1.5 days), which is a bit long... Exim has a max delay of
-    // 6 hours (configurable) and the expire time is also configurable... But
-    // this is good enough for now.
+    // // Note: More advanced options should be explored in the future as the
+    // // last delay is 2**17 secs (1.5 days), which is a bit long... Exim has a max delay of
+    // // 6 hours (configurable) and the expire time is also configurable... But
+    // // this is good enough for now.
 
-    const delay = Math.pow(2, (this.num_failures + 5));
+    // const delay = Math.pow(2, (this.num_failures + 5));
 
-    plugins.run_hooks('deferred', this, {delay: delay, err: err});
+    // plugins.run_hooks('deferred', this, {delay: delay, err: err});
 };
 
 HMailItem.prototype.deferred_respond = function (retval, msg, params) {
